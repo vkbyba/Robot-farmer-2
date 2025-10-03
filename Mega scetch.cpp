@@ -1,34 +1,23 @@
-/* ===================== ROBOT MEGA + ESP-01 (AT) + NRF24 =====================
- * Функції:
- *  - Підключення ESP-01 (AT 1.7.x) до Wi-Fi (STA), друк MEGA IP у Serial
- *  - UDP "слухач" на порту 4210 (AT+CIPMUX=1 / link_id=0)
- *  - Керування рядками:
- *      "DRV L=X R=Y"       X,Y = -255..255
- *      "SRV ID=<root|a1|a2|armb|wrista|wristb|grip> A=N" (N=0..180)
- *      "STOP"
- *  - NRF24 пульт (той самий формат), пріоритет над UDP
- *  - Тайм-аут безпеки: якщо довго немає команд — STOP
- *
- * Підключення MEGA <-> ESP-01:
- *   MEGA TX2 (D16) --(дільник 2к..3к : 3.3к)--> ESP RX
- *   MEGA RX2 (D17) <--------------------------- ESP TX (напряму)
- *   GND спільна; живлення ESP-01 через синій адаптер 5V->3V3.
- *
- * ВАЖЛИВО: На ESP-01 встанови 115200: AT+UART_DEF=115200,8,1,0,0
- * ========================================================================== */
+/* ========== MEGA + ESP-01 (AT) + NRF24 (опц.) — UDP control, діагностика ========== */
 
 #include <Servo.h>
 
-// =================== НАЛАШТУВАННЯ Wi-Fi ===================
-const char* WIFI_SSID = "5 kv";
-const char* WIFI_PASS = "Nz31032020";
+// --------- ТУТ ВКЛ/ВИКЛ РЕЖИМИ ---------
+#define USE_NRF24       1   // 1 — використовувати NRF24, 0 — без пульта
+#define FORCE_NO_PULT   0   // 1 — тимчасово ІГНОРУВАТИ пульт, навіть якщо USE_NRF24=1
+#define DEBUG_RAW       1   // 1 — показувати сирі байти з ESP-01 (для діагностики)
+#define DBG_STATUS_EVERY_MS 2000
+
+// --------- Wi-Fi ---------
+const char* WIFI_SSID = "MERCUSYS";
+const char* WIFI_PASS = "0987996434";
 const uint16_t UDP_PORT = 4210;
 
-// =================== МОТОРИ (приклад для L298N) ===================
+// --------- Мотори (L298N приклад) ---------
 const int L_IN1=22, L_IN2=23, R_IN1=24, R_IN2=25;
-const int L_EN=11, R_EN=12; // PWM
+const int L_EN=11, R_EN=12; // PWM (на МЕГА ок)
 
-// =================== СЕРВО ===================
+// --------- Серво ---------
 const int SERVO_ROOT_PIN = 2;
 const int SERVO_A1_PIN   = 3;
 const int SERVO_A2_PIN   = 4;
@@ -37,9 +26,8 @@ const int SERVO_WA_PIN   = 6;
 const int SERVO_WB_PIN   = 7;
 const int SERVO_GRIP_PIN = 8;
 
-// =================== NRF24 (пульт) ===================
-#define USE_NRF24 1      // 1 — увімкнено NRF24, 0 — вимкнено (скомпілюється без RF24)
-const uint32_t RADIO_ACTIVE_MS = 1200; // активність після останнього пакета з пульта
+// --------- NRF24 (пульт) ---------
+const uint32_t RADIO_ACTIVE_MS = 1200;
 const uint8_t  PULT_FORCE_PIN  = 30;   // LOW = примусовий режим пульта
 
 #if USE_NRF24
@@ -51,20 +39,20 @@ const uint8_t  PULT_FORCE_PIN  = 30;   // LOW = примусовий режим 
   volatile uint32_t lastRadioTs = 0;
 #endif
 
-// =================== ГЛОБАЛЬНІ ===================
+// --------- Глобальні ---------
 Servo sRoot, sA1, sA2, sB, sWA, sWB, sGrip;
-uint32_t lastCmdTs = 0;                 // остання валідна команда (UDP або Radio)
-const uint32_t CMD_TIMEOUT_MS = 3000;   // авто-STOP якщо тиша
+uint32_t lastCmdTs = 0;
+const uint32_t CMD_TIMEOUT_MS = 3000;
+uint32_t lastDbgTs = 0;
 
-// =================== ПРОТОТИПИ ===================
+// --------- Прототипи ---------
 String atReadLine(uint32_t timeout_ms=800);
 bool atCmd(const String& cmd, const char* okToken="OK", uint32_t timeout_ms=2000, bool echoToUSB=true);
-bool atReadUdpPacket(String& out, String* srcIp=nullptr, uint16_t* srcPort=nullptr, uint32_t timeout_ms=10);
+bool atReadUdpPacket(String& out, String* srcIp=nullptr, uint16_t* srcPort=nullptr, uint32_t timeout_ms=50);
 bool udpSendTo(const String& ip, uint16_t port, const String& data);
 bool wifiConnect();
 bool udpStart(uint16_t port);
 String getStaIp_(uint32_t total_ms=4000);
-
 void driveLR(int L, int R);
 void allStop();
 void setJoint(const String& id, int ang);
@@ -104,7 +92,7 @@ bool atCmd(const String& cmd, const char* okToken, uint32_t timeout_ms, bool ech
   return (okToken && buf.indexOf(okToken)>=0);
 }
 
-// ======== ПАТЧЕНИЙ універсальний парсер +IPD (MUX/CIPDINFO будь-які) ========
+// ======== УНІВЕРСАЛЬНИЙ парсер +IPD (MUX/CIPDINFO будь-які) ========
 bool atReadUdpPacket(String& out, String* srcIp, uint16_t* srcPort, uint32_t timeout_ms) {
   static String acc;
   unsigned long t0 = millis();
@@ -113,6 +101,9 @@ bool atReadUdpPacket(String& out, String* srcIp, uint16_t* srcPort, uint32_t tim
   while (millis() - t0 < timeout_ms) {
     while (Serial2.available()) {
       char c = (char)Serial2.read();
+#if DEBUG_RAW
+      Serial.write(c); // покажемо абсолютно все, що йде від ESP-01
+#endif
       acc += c;
 
       int p = acc.indexOf("+IPD,");
@@ -124,9 +115,8 @@ bool atReadUdpPacket(String& out, String* srcIp, uint16_t* srcPort, uint32_t tim
       if (colon < 0) continue;
 
       String header = trim(acc.substring(p+5, colon)); // між "+IPD," і ':'
-      // приклади: "0,17" | "17" | "0,17,192.168.1.50,50624" | "17,192.168.1.50,50624"
 
-      // 1) Визначимо довжину — це останнє ЧИСЛО перед двокрапкою або перед портом
+      // 1) довжина: останнє числове перед ':' або перед портом
       int lastComma = header.lastIndexOf(',');
       String lastTok = (lastComma>=0) ? header.substring(lastComma+1) : header;
       lastTok = trim(lastTok);
@@ -139,18 +129,15 @@ bool atReadUdpPacket(String& out, String* srcIp, uint16_t* srcPort, uint32_t tim
 
       int dataLen = -1;
       if (isNum(lastTok)) {
-        // Може бути порт. Тоді попередній токен — довжина
         if (lastComma >= 0) {
           int prevComma = header.lastIndexOf(',', lastComma-1);
           String prevTok = (prevComma>=0) ? header.substring(prevComma+1, lastComma) : header.substring(0,lastComma);
           prevTok = trim(prevTok);
-          if (isNum(prevTok)) dataLen = prevTok.toInt();
-          else                dataLen = lastTok.toInt();
+          dataLen = isNum(prevTok) ? prevTok.toInt() : lastTok.toInt();
         } else {
           dataLen = lastTok.toInt();
         }
       } else {
-        // останній токен не числовий — шукаємо останню числову послідовність
         int i = header.length()-1; while (i>=0 && (header[i]<'0'||header[i]>'9')) i--;
         int endNum = i; while (i>=0 && (header[i]>='0'&&header[i]<='9')) i--;
         int startNum = i+1;
@@ -176,11 +163,17 @@ bool atReadUdpPacket(String& out, String* srcIp, uint16_t* srcPort, uint32_t tim
       if (srcIp)   *srcIp   = ip;
       if (srcPort) *srcPort = port;
 
-      // 3) Прочитаємо рівно dataLen байтів
+      // 3) дочитаємо рівно dataLen байтів тіла
       String payload; payload.reserve(dataLen+2);
       while ((int)payload.length() < dataLen) {
         int n = Serial2.available();
-        if (n>0) { while (n-- && (int)payload.length()<dataLen) payload += (char)Serial2.read(); }
+        if (n>0) { while (n-- && (int)payload.length()<dataLen) {
+          char cc=(char)Serial2.read();
+#if DEBUG_RAW
+          Serial.write(cc);
+#endif
+          payload += cc;
+        } }
       }
       out = payload;
       acc.remove(0, colon + 1 + dataLen);
@@ -205,7 +198,13 @@ String getStaIp_(uint32_t total_ms) {
   while (millis() - t0 < total_ms) {
     Serial2.print("AT+CIFSR\r\n");
     unsigned long t1 = millis();
-    while (millis() - t1 < 600) { while (Serial2.available()) resp += (char)Serial2.read(); }
+    while (millis() - t1 < 600) { while (Serial2.available()) {
+      char c=(char)Serial2.read();
+#if DEBUG_RAW
+      Serial.write(c);
+#endif
+      resp += c;
+    } }
     int pos = resp.indexOf("STAIP,\"");
     if (pos >= 0) {
       int st = pos + 7, en = resp.indexOf("\"", st);
@@ -222,11 +221,17 @@ bool wifiConnect(){
   atCmd("ATE0");
   atCmd("AT");
   atCmd("AT+CWMODE=1");
-
+  atCmd("AT+CIPRECVMODE=0");  // push mode (на всяк)
   // MUX=1
   Serial2.print("AT+CIPMUX?\r\n");
   String q; unsigned long t0 = millis();
-  while (millis()-t0 < 800) { while (Serial2.available()) q += (char)Serial2.read(); }
+  while (millis()-t0 < 800) { while (Serial2.available()) {
+    char c=(char)Serial2.read();
+#if DEBUG_RAW
+    Serial.write(c);
+#endif
+    q += c;
+  } }
   if (q.indexOf("+CIPMUX:1") < 0) {
     if (!atCmd("AT+CIPMUX=1", "OK", 1500)) { Serial.println("[WiFi] CIPMUX=1 FAIL"); return false; }
   }
@@ -250,7 +255,13 @@ bool udpStart(uint16_t port){
   // переконаємось у MUX=1
   Serial2.print("AT+CIPMUX?\r\n");
   String q; unsigned long t0 = millis();
-  while (millis()-t0 < 500) { while (Serial2.available()) q += (char)Serial2.read(); }
+  while (millis()-t0 < 500) { while (Serial2.available()) {
+    char c=(char)Serial2.read();
+#if DEBUG_RAW
+    Serial.write(c);
+#endif
+    q += c;
+  } }
   if (q.indexOf("+CIPMUX:1") < 0) {
     if (!atCmd("AT+CIPMUX=1", "OK", 1500)) { Serial.println("[UDP] Cannot set CIPMUX=1"); return false; }
   }
@@ -290,7 +301,7 @@ void setJoint(const String& id, int ang){
   else if(id=="grip")   sGrip.write(a);
 }
 
-// Єдиний парсер для обох джерел (UDP/Radio)
+// Єдиний парсер
 void parseCommand(const String& s, const char* src){
   String t=s; t.trim(); t.toLowerCase();
   if (t.length()==0) return;
@@ -320,7 +331,7 @@ void parseCommand(const String& s, const char* src){
 // =================== SETUP / LOOP ===================
 void setup(){
   Serial.begin(115200);
-  Serial.println("\nMEGA + ESP-01 (AT) + NRF24 — UDP 4210, Radio priority");
+  Serial.println("\nMEGA + ESP-01 (AT) — UDP 4210; діагностика увімкнена");
 
   pinMode(PULT_FORCE_PIN, INPUT_PULLUP); // LOW = примусовий пульт
 
@@ -339,7 +350,7 @@ void setup(){
   sWB.attach(SERVO_WB_PIN);
   sGrip.attach(SERVO_GRIP_PIN);
 
-  // Лінк до ESP-01 (115200 має збігатися з AT+UART_DEF)
+  // Зв'язок із ESP-01
   Serial2.begin(115200);
   delay(400);
 
@@ -354,14 +365,16 @@ void setup(){
   }
 
 #if USE_NRF24
-  if (radio.begin()) {
-    radio.setPALevel(RF24_PA_LOW);
-    radio.setDataRate(RF24_1MBPS);
-    radio.openReadingPipe(1, PIPE_ADDR);
-    radio.startListening();
-    Serial.println("[NRF24] Ready (listening)");
-  } else {
-    Serial.println("[NRF24] Init FAIL");
+  if (!FORCE_NO_PULT) {
+    if (radio.begin()) {
+      radio.setPALevel(RF24_PA_LOW);
+      radio.setDataRate(RF24_1MBPS);
+      radio.openReadingPipe(1, PIPE_ADDR);
+      radio.startListening();
+      Serial.println("[NRF24] Ready (listening)");
+    } else {
+      Serial.println("[NRF24] Init FAIL");
+    }
   }
 #endif
 }
@@ -371,22 +384,23 @@ void loop(){
   bool radioActive = false;
 
 #if USE_NRF24
-  // 1) RADIO прийом
-  if (radio.available()) {
-    char buf[64]={0}; radio.read(buf, sizeof(buf)-1);
-    String s(buf); s.trim();
-    if (s.length()) {
-      parseCommand(s, "RADIO");
-      lastRadioTs = millis();
+  if (!FORCE_NO_PULT) {
+    if (radio.available()) {
+      char buf[64]={0}; radio.read(buf, sizeof(buf)-1);
+      String s(buf); s.trim();
+      if (s.length()) {
+        parseCommand(s, "RADIO");
+        lastRadioTs = millis();
+      }
     }
+    radioActive = (millis() - lastRadioTs) < RADIO_ACTIVE_MS;
   }
-  radioActive = (millis() - lastRadioTs) < RADIO_ACTIVE_MS;
 #endif
 
-  // 2) UDP прийом (лише якщо пульт не примусово та не активний)
-  if (!pultForced && !radioActive) {
+  // UDP прийом (лише якщо пульт не примусово та не активний, або FORCE_NO_PULT=1)
+  if (FORCE_NO_PULT || (!pultForced && !radioActive)) {
     String pkt, ip; uint16_t port=0;
-    if (atReadUdpPacket(pkt, &ip, &port, 5)) {
+    if (atReadUdpPacket(pkt, &ip, &port, 50)) {
       Serial.print("[UDP "); 
       if (ip.length()) { Serial.print(ip); Serial.print(":"); Serial.print(port); }
       Serial.print("] "); Serial.println(pkt);
@@ -394,7 +408,19 @@ void loop(){
     }
   }
 
-  // 3) Безпека: STOP якщо довго немає команд
+  // Статус раз на 2с
+  if (millis() - lastDbgTs > DBG_STATUS_EVERY_MS) {
+    lastDbgTs = millis();
+    Serial.print("[STAT] pultForced="); Serial.print(pultForced);
+#if USE_NRF24
+    Serial.print(" radioActive="); Serial.print(radioActive);
+#else
+    Serial.print(" radioActive=0");
+#endif
+    Serial.println(FORCE_NO_PULT ? " (FORCE_NO_PULT=1)" : "");
+  }
+
+  // Безпека: STOP якщо довго немає команд
   if (millis() - lastCmdTs > CMD_TIMEOUT_MS) {
     allStop();
   }
